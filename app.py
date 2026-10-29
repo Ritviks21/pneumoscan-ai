@@ -4,8 +4,11 @@ from pathlib import Path
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, ImageOps
 
+# --------------------------------------------------
+# Page setup
+# --------------------------------------------------
 st.set_page_config(
     page_title="PneumoScan AI",
     page_icon="🫁",
@@ -20,107 +23,183 @@ MODELS = {
     "MobileNetV2 - Fine-tuned": "mobilenet_finetuned.keras",
 }
 
-
-@st.cache_resource(show_spinner="Loading model...")
+# --------------------------------------------------
+# Model loading
+# --------------------------------------------------
+@st.cache_resource(show_spinner=False)
 def load_model(model_path):
-    # compile=False avoids loading the saved optimizer and training metrics.
+    path = Path(model_path)
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Model file not found: {path.name}"
+        )
+
+    # compile=False avoids restoring training optimizer state.
     return tf.keras.models.load_model(
-        model_path,
+        str(path),
         compile=False,
-        safe_mode=True,
     )
 
 
-def preprocess_image(image, model_name):
-    image = image.convert("L").resize((224, 224))
+# --------------------------------------------------
+# Image preprocessing
+# --------------------------------------------------
+def prepare_image(image, model_name, model):
+    image = ImageOps.exif_transpose(image).convert("L")
+    image = image.resize((224, 224))
+
     pixels = np.asarray(image, dtype=np.float32)
 
-    if model_name == "Baseline CNN":
-        # The baseline CNN rescales pixels internally.
-        pixels = pixels[np.newaxis, :, :, np.newaxis]
+    # Check the saved model's expected input channels.
+    input_shape = model.input_shape
+
+    if isinstance(input_shape, list):
+        raise ValueError(
+            "This app expects a model with one image input."
+        )
+
+    channels = input_shape[-1]
+
+    if channels == 1:
+        # Baseline CNN applies its own 1/255 rescaling.
+        batch = pixels[np.newaxis, :, :, np.newaxis]
+
+    elif channels == 3:
+        # MobileNetV2 training used grayscale repeated to RGB
+        # and pixel values scaled from [0, 255] to [-1, 1].
+        rgb = np.repeat(pixels[:, :, np.newaxis], 3, axis=2)
+        rgb = rgb / 127.5 - 1.0
+        batch = rgb[np.newaxis, ...]
+
     else:
-        # Match the MobileNetV2 preprocessing used during training.
-        pixels = np.repeat(pixels[..., np.newaxis], 3, axis=-1)
-        pixels = pixels / 127.5 - 1.0
-        pixels = pixels[np.newaxis, ...]
+        raise ValueError(
+            f"Unsupported model input shape: {input_shape}"
+        )
 
-    return pixels
+    return batch
 
 
+# --------------------------------------------------
+# Dashboard
+# --------------------------------------------------
 st.title("🫁 PneumoScan AI")
 st.subheader("Pediatric Chest X-ray Classification")
 
 st.write(
-    "An academic demonstration comparing a baseline CNN "
-    "with two MobileNetV2 transfer-learning models."
+    "Compare a baseline CNN with frozen and fine-tuned "
+    "MobileNetV2 models using the PneumoniaMNIST benchmark."
 )
 
 st.warning(
-    "Research use only. This prototype is not a medical device. "
-    "Predictions may be wrong and must not guide clinical decisions."
+    "Academic research prototype only. This application is "
+    "not a medical device and must not be used for diagnosis "
+    "or treatment decisions."
 )
 
 with st.sidebar:
     st.header("Model selection")
-    selected_model = st.selectbox("Choose a model", list(MODELS))
+
+    selected_model = st.selectbox(
+        "Choose a model",
+        list(MODELS.keys()),
+    )
+
     st.divider()
     st.write("Input size: 224 × 224")
     st.write("Dataset: PneumoniaMNIST")
 
-uploaded = st.file_uploader(
+uploaded_file = st.file_uploader(
     "Upload a chest X-ray image",
     type=["png", "jpg", "jpeg"],
 )
 
-if uploaded is not None:
+if uploaded_file is None:
+    st.info("Upload a chest X-ray to begin.")
+
+else:
     try:
-        image = Image.open(uploaded).convert("RGB")
-        st.image(image, caption="Uploaded X-ray", width=450)
+        image = Image.open(uploaded_file)
+        image = ImageOps.exif_transpose(image).convert("RGB")
+
+        left, right = st.columns(2)
+
+        with left:
+            st.image(
+                image,
+                caption="Uploaded chest X-ray",
+                use_container_width=True,
+            )
+
+        with right:
+            st.markdown("### Selected model")
+            st.write(selected_model)
+            st.markdown("### Image dimensions")
+            st.write(f"{image.width} × {image.height} pixels")
 
         if st.button("Analyze X-ray", type="primary"):
             model_path = BASE_DIR / MODELS[selected_model]
 
-            if not model_path.exists():
-                st.error(f"Missing model file: {model_path.name}")
-                st.stop()
+            try:
+                with st.spinner(
+                    f"Loading {selected_model} and predicting..."
+                ):
+                    model = load_model(str(model_path))
+                    batch = prepare_image(
+                        image,
+                        selected_model,
+                        model,
+                    )
 
-            with st.spinner("Running model prediction..."):
-                model = load_model(str(model_path))
-                batch = preprocess_image(image, selected_model)
-                prediction = np.asarray(
-                    model.predict(batch, verbose=0)
-                ).reshape(-1)
+                    output = model.predict(batch, verbose=0)
+                    output = np.asarray(output)
 
-            if prediction.size != 1:
-                st.error(
-                    "Expected one sigmoid output, but the model "
-                    "returned a different output shape."
+                if output.size != 1:
+                    st.error(
+                        "Expected one sigmoid output, but the model "
+                        f"returned shape {output.shape}."
+                    )
+                    st.stop()
+
+                score = float(output.reshape(-1)[0])
+
+                if not np.isfinite(score) or not 0 <= score <= 1:
+                    st.error(
+                        "The model output is not a valid sigmoid score."
+                    )
+                    st.stop()
+
+                st.divider()
+                st.subheader("Model output")
+
+                st.write(f"**Selected model:** {selected_model}")
+                st.metric("Raw sigmoid output", f"{score:.4f}")
+
+                st.caption(
+                    "This is the model's raw output, not a verified "
+                    "clinical probability. Confirm the training label "
+                    "mapping before interpreting the score as a class."
                 )
-                st.stop()
 
-            score = float(prediction[0])
-
-            if not np.isfinite(score) or not 0 <= score <= 1:
-                st.error("The model returned an invalid score.")
-                st.stop()
-
-            st.divider()
-            st.subheader("Model output")
-            st.write(f"Selected model: **{selected_model}**")
-            st.metric("Sigmoid output", f"{score:.4f}")
-
-            st.caption(
-                "The score is the raw sigmoid output. Confirm the "
-                "training label mapping before interpreting it as "
-                "Pneumonia probability or assigning a class label."
-            )
+            except Exception as exc:
+                st.error(
+                    f"Prediction failed for {selected_model}."
+                )
+                st.code(
+                    f"{type(exc).__name__}: {exc}",
+                    language="text",
+                )
+                st.info(
+                    "Share this error if the model still fails. "
+                    "It identifies the actual loading or prediction issue."
+                )
 
     except Exception as exc:
-    st.error("Model loading or prediction failed.")
-    st.exception(exc)
-
-else:
-    st.info("Upload a chest X-ray to begin.")
+        st.error("The uploaded image could not be opened.")
+        st.code(
+            f"{type(exc).__name__}: {exc}",
+            language="text",
+        )
 
 st.divider()
 st.caption("PneumoScan AI | Student research prototype")
