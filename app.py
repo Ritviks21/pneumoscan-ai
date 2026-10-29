@@ -4,10 +4,10 @@ from pathlib import Path
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # --------------------------------------------------
-# Page setup
+# Page configuration
 # --------------------------------------------------
 st.set_page_config(
     page_title="PneumoScan AI",
@@ -23,8 +23,11 @@ MODELS = {
     "MobileNetV2 - Fine-tuned": "mobilenet_finetuned.keras",
 }
 
+IMAGE_SIZE = (224, 224)
+
+
 # --------------------------------------------------
-# Model loading
+# Load one model when selected
 # --------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model(model_path):
@@ -43,38 +46,50 @@ def load_model(model_path):
 
 
 # --------------------------------------------------
-# Image preprocessing
+# Preprocess image to match the saved model
 # --------------------------------------------------
-def prepare_image(image, model_name, model):
+def prepare_image(image, model):
     image = ImageOps.exif_transpose(image).convert("L")
-    image = image.resize((224, 224))
+    image = image.resize(IMAGE_SIZE)
 
     pixels = np.asarray(image, dtype=np.float32)
-
-    # Check the saved model's expected input channels.
     input_shape = model.input_shape
 
     if isinstance(input_shape, list):
         raise ValueError(
-            "This app expects a model with one image input."
+            "This application supports models with one image input."
         )
 
-    channels = input_shape[-1]
+    if len(input_shape) != 4:
+        raise ValueError(
+            f"Expected a 4D image input, got {input_shape}."
+        )
+
+    height, width, channels = input_shape[1:]
+
+    if height not in (None, IMAGE_SIZE[1]) or width not in (
+        None,
+        IMAGE_SIZE[0],
+    ):
+        raise ValueError(
+            f"Model expects input shape {input_shape}, "
+            "but this app preprocesses images to 224 × 224."
+        )
 
     if channels == 1:
-        # Baseline CNN applies its own 1/255 rescaling.
+        # Baseline CNN rescales [0, 255] internally.
         batch = pixels[np.newaxis, :, :, np.newaxis]
 
     elif channels == 3:
-        # MobileNetV2 training used grayscale repeated to RGB
-        # and pixel values scaled from [0, 255] to [-1, 1].
+        # Match the MobileNetV2 training preprocessing.
         rgb = np.repeat(pixels[:, :, np.newaxis], 3, axis=2)
         rgb = rgb / 127.5 - 1.0
         batch = rgb[np.newaxis, ...]
 
     else:
         raise ValueError(
-            f"Unsupported model input shape: {input_shape}"
+            f"Unsupported model input channels: {channels}. "
+            f"Model input shape: {input_shape}"
         )
 
     return batch
@@ -88,13 +103,12 @@ st.subheader("Pediatric Chest X-ray Classification")
 
 st.write(
     "Compare a baseline CNN with frozen and fine-tuned "
-    "MobileNetV2 models using the PneumoniaMNIST benchmark."
+    "MobileNetV2 models on the PneumoniaMNIST benchmark."
 )
 
 st.warning(
-    "Academic research prototype only. This application is "
-    "not a medical device and must not be used for diagnosis "
-    "or treatment decisions."
+    "Research prototype only. This application is not a medical "
+    "device. Do not use its predictions to diagnose or treat anyone."
 )
 
 with st.sidebar:
@@ -106,7 +120,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.write("Input size: 224 × 224")
+    st.write("Input size: 224 × 224 pixels")
     st.write("Dataset: PneumoniaMNIST")
 
 uploaded_file = st.file_uploader(
@@ -115,19 +129,19 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is None:
-    st.info("Upload a chest X-ray to begin.")
+    st.info("Upload a chest X-ray image to begin.")
 
 else:
     try:
         image = Image.open(uploaded_file)
         image = ImageOps.exif_transpose(image).convert("RGB")
 
-        left, right = st.columns(2)
+        left, right = st.columns([1, 1])
 
         with left:
             st.image(
                 image,
-                caption="Uploaded chest X-ray",
+                caption="Uploaded X-ray",
                 use_container_width=True,
             )
 
@@ -142,59 +156,70 @@ else:
 
             try:
                 with st.spinner(
-                    f"Loading {selected_model} and predicting..."
+                    f"Loading {selected_model} and analyzing image..."
                 ):
                     model = load_model(str(model_path))
-                    batch = prepare_image(
-                        image,
-                        selected_model,
-                        model,
-                    )
+                    batch = prepare_image(image, model)
 
                     output = model.predict(batch, verbose=0)
                     output = np.asarray(output)
 
                 if output.size != 1:
-                    st.error(
-                        "Expected one sigmoid output, but the model "
-                        f"returned shape {output.shape}."
+                    raise ValueError(
+                        "Expected exactly one sigmoid output, "
+                        f"but the model returned shape {output.shape}."
                     )
-                    st.stop()
 
                 score = float(output.reshape(-1)[0])
 
-                if not np.isfinite(score) or not 0 <= score <= 1:
-                    st.error(
-                        "The model output is not a valid sigmoid score."
+                if not np.isfinite(score) or not 0.0 <= score <= 1.0:
+                    raise ValueError(
+                        f"Expected a sigmoid score from 0 to 1; "
+                        f"received {score}."
                     )
-                    st.stop()
+
+                # Assumes training labels are 0 = Normal,
+                # 1 = Pneumonia and the sigmoid output represents class 1.
+                pneumonia_score = score
 
                 st.divider()
-                st.subheader("Model output")
+                st.subheader("Prediction result")
+                st.write(f"**Model:** {selected_model}")
 
-                st.write(f"**Selected model:** {selected_model}")
-                st.metric("Raw sigmoid output", f"{score:.4f}")
+                if pneumonia_score >= 0.5:
+                    st.error("YES — Model predicts Pneumonia")
+                    displayed_score = pneumonia_score
+                    score_label = "Pneumonia model score"
+                else:
+                    st.success("NO — Model predicts Normal")
+                    displayed_score = 1.0 - pneumonia_score
+                    score_label = "Normal model score"
+
+                st.metric(
+                    score_label,
+                    f"{displayed_score * 100:.1f}%",
+                )
+
+                st.progress(displayed_score)
 
                 st.caption(
-                    "This is the model's raw output, not a verified "
-                    "clinical probability. Confirm the training label "
-                    "mapping before interpreting the score as a class."
+                    "The percentage is a model score derived from its "
+                    "sigmoid output, not a medically verified probability. "
+                    "The YES/NO mapping assumes class 0 = Normal and "
+                    "class 1 = Pneumonia. Predictions can be incorrect."
                 )
 
             except Exception as exc:
                 st.error(
-                    f"Prediction failed for {selected_model}."
+                    f"Analysis failed for {selected_model}. "
+                    "The details are shown below."
                 )
                 st.code(
                     f"{type(exc).__name__}: {exc}",
                     language="text",
                 )
-                st.info(
-                    "Share this error if the model still fails. "
-                    "It identifies the actual loading or prediction issue."
-                )
 
-    except Exception as exc:
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         st.error("The uploaded image could not be opened.")
         st.code(
             f"{type(exc).__name__}: {exc}",
@@ -202,4 +227,4 @@ else:
         )
 
 st.divider()
-st.caption("PneumoScan AI | Student research prototype")
+st.caption("PneumoScan AI | Academic research prototype")
