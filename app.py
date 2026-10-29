@@ -115,12 +115,9 @@ if uploaded is not None:
                 "Pneumonia probability or assigning a class label."
             )
 
-    except Exception:
-        st.error(
-            "Model loading or prediction failed. Check the first "
-            "error in the Streamlit app logs."
-        )
-        st.exception(Exception("See the original error in the logs."))
+    except Exception as exc:
+    st.error("Model loading or prediction failed.")
+    st.exception(exc)
 
 else:
     st.info("Upload a chest X-ray to begin.")
